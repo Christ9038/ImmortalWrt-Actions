@@ -1,0 +1,366 @@
+name: Build RK3568 ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ImmortalWrt version, e.g. v25.12.2. Leave empty for latest v25.12.x stable."
+        required: false
+        type: string
+
+  # 如果以后想定期自动检查新版本，可以打开：
+  # schedule:
+  #   - cron: "0 20 * * 6"
+
+permissions:
+  contents: read
+
+env:
+  IMMORTALWRT_REPO: https://github.com/immortalwrt/immortalwrt.git
+  IMMORTALWRT_SERIES: "25.12"
+
+jobs:
+  build:
+    name: RK3568 / ImmortalWrt
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout 我们自己的配置仓库
+      # ------------------------------------------------------------
+      - name: Checkout build config
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 确定要构建的 ImmortalWrt 正式版
+      #
+      # 手工指定:
+      #   v25.12.2
+      #
+      # 不指定:
+      #   自动从所有 v25.12.x tag 中找最高正式版本
+      #
+      # 不接受:
+      #   rc / beta / snapshot 等
+      # ------------------------------------------------------------
+      - name: Resolve ImmortalWrt version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUESTED="${{ inputs.version }}"
+
+          if [[ -n "${REQUESTED}" ]]; then
+            VERSION="${REQUESTED}"
+          else
+            VERSION="$(
+              git ls-remote \
+                --refs \
+                --tags \
+                "${IMMORTALWRT_REPO}" \
+                "v${IMMORTALWRT_SERIES}.*" \
+              | awk -F/ '{print $3}' \
+              | grep -E "^v${IMMORTALWRT_SERIES}\.[0-9]+$" \
+              | sort -V \
+              | tail -n 1
+            )"
+          fi
+
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::Unable to resolve ImmortalWrt ${IMMORTALWRT_SERIES}.x stable tag"
+            exit 1
+          fi
+
+          if ! [[ "${VERSION}" =~ ^v25\.12\.[0-9]+$ ]]; then
+            echo "::error::Invalid version: ${VERSION}"
+            echo "Only v25.12.x stable releases are allowed."
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+          echo "======================================"
+          echo "ImmortalWrt version: ${VERSION}"
+          echo "======================================"
+
+      # ------------------------------------------------------------
+      # 安装 OpenWrt / ImmortalWrt host 编译依赖
+      # ------------------------------------------------------------
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            python3-setuptools \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            curl \
+            jq \
+            libelf-dev \
+            libzstd-dev \
+            zstd \
+            swig \
+            time \
+            ccache
+
+      # ------------------------------------------------------------
+      # 拉取对应 release tag
+      #
+      # 这里不跟 openwrt-25.12 branch。
+      # 每次 build 都以正式发布 tag 为底座。
+      # ------------------------------------------------------------
+      - name: Clone ImmortalWrt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "${{ steps.version.outputs.version }}" \
+            "${IMMORTALWRT_REPO}" \
+            immortalwrt
+
+          cd immortalwrt
+
+          echo "ImmortalWrt commit:"
+          git log -1 --oneline
+
+          echo
+          echo "Official feeds:"
+          cat feeds.conf.default
+
+      # ------------------------------------------------------------
+      # 缓存源码下载目录
+      #
+      # dl/ 可以安全跨 patch release 重用，
+      # 不缓存 staging_dir/build_dir，避免诡异 ABI/工具链污染。
+      # ------------------------------------------------------------
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: immortalwrt-dl-${{ runner.os }}-${{ steps.version.outputs.version }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}
+          restore-keys: |
+            immortalwrt-dl-${{ runner.os }}-${{ steps.version.outputs.version }}-
+            immortalwrt-dl-${{ runner.os }}-
+
+      # ------------------------------------------------------------
+      # 自定义源码
+      #
+      # customize.sh 将负责：
+      #
+      # 1. 添加 PassWall2 feeds
+      # 2. feeds update/install
+      # 3. 替换 MosDNS 为 sbwml v5
+      #
+      # Argon 暂时使用 ImmortalWrt 官方 LuCI feed 自带版本。
+      # ------------------------------------------------------------
+      - name: Apply custom packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x scripts/customize.sh
+
+          cd immortalwrt
+
+          "${GITHUB_WORKSPACE}/scripts/customize.sh"
+
+      # ------------------------------------------------------------
+      # 加载 RK3568 seed config
+      # ------------------------------------------------------------
+      - name: Load RK3568 config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f configs/RK3568.config
+
+          cp configs/RK3568.config immortalwrt/.config
+
+          cd immortalwrt
+
+          make defconfig
+
+          echo "======================================"
+          echo "Target configuration"
+          echo "======================================"
+
+          grep -E \
+            'CONFIG_TARGET_|CONFIG_PACKAGE_luci-app-passwall2|CONFIG_PACKAGE_luci-app-mosdns|CONFIG_PACKAGE_luci-theme-argon' \
+            .config \
+            || true
+
+      # ------------------------------------------------------------
+      # 下载所有源码
+      #
+      # -j8 足够，不建议直接 nproc*2 疯狂请求镜像站。
+      # 下载失败时单线程再跑一次方便定位。
+      # ------------------------------------------------------------
+      - name: Download sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd immortalwrt
+
+          make download -j8 || make download -j1 V=s
+
+          # 删除明显损坏/空文件，避免进入编译阶段才发现
+          find dl -size -1024c -type f -print -delete || true
+
+      # ------------------------------------------------------------
+      # 编译
+      #
+      # 第一次并行构建追求速度。
+      # 如果失败，用单线程 V=s 重跑一次，
+      # GitHub Actions 日志会直接显示真正的编译错误。
+      # ------------------------------------------------------------
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd immortalwrt
+
+          echo "Building with $(nproc) threads..."
+
+          if ! make -j"$(nproc)"; then
+            echo
+            echo "======================================"
+            echo "Parallel build failed."
+            echo "Retrying with -j1 V=s..."
+            echo "======================================"
+            echo
+
+            make -j1 V=s
+          fi
+
+      # ------------------------------------------------------------
+      # 保存最终实际 config
+      #
+      # 这个很有用：
+      # RK3568.config 是 seed，
+      # build.config 是 make defconfig 后展开的真实完整配置。
+      # ------------------------------------------------------------
+      - name: Collect build metadata
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p output/meta
+
+          if [[ -f immortalwrt/.config ]]; then
+            cp immortalwrt/.config output/meta/build.config
+          fi
+
+          if [[ -d immortalwrt/.git ]]; then
+            git -C immortalwrt rev-parse HEAD \
+              > output/meta/immortalwrt-commit.txt
+          fi
+
+          echo "${{ steps.version.outputs.version }}" \
+            > output/meta/immortalwrt-version.txt
+
+          if [[ -f immortalwrt/feeds.conf.default ]]; then
+            cp immortalwrt/feeds.conf.default \
+              output/meta/feeds.conf.default
+          fi
+
+      # ------------------------------------------------------------
+      # 整理 RK3568 固件
+      # ------------------------------------------------------------
+      - name: Collect firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_DIR="immortalwrt/bin/targets/rockchip/armv8"
+
+          if [[ ! -d "${TARGET_DIR}" ]]; then
+            echo "::error::Expected target directory does not exist:"
+            echo "${TARGET_DIR}"
+
+            echo
+            echo "Available targets:"
+            find immortalwrt/bin/targets \
+              -maxdepth 2 \
+              -type d \
+              2>/dev/null \
+              || true
+
+            exit 1
+          fi
+
+          mkdir -p output/firmware
+
+          cp -av "${TARGET_DIR}/." output/firmware/
+
+          echo
+          echo "======================================"
+          echo "Firmware output"
+          echo "======================================"
+
+          find output/firmware \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort
+
+      # ------------------------------------------------------------
+      # 上传 GitHub Actions Artifact
+      # ------------------------------------------------------------
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: RK3568-ImmortalWrt-${{ steps.version.outputs.version }}
+          path: |
+            output/firmware/
+            output/meta/
+          if-no-files-found: error
+          retention-days: 30
+
+      # ------------------------------------------------------------
+      # Build Summary
+      # ------------------------------------------------------------
+      - name: Build summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## RK3568 ImmortalWrt Build"
+            echo
+            echo "- ImmortalWrt: \`${{ steps.version.outputs.version }}\`"
+            echo "- Target: \`rockchip/armv8\`"
+            echo "- PassWall2: \`main\`"
+            echo "- MosDNS: \`sbwml/v5\`"
+            echo "- Argon: ImmortalWrt LuCI feed"
+            echo
+            echo "### Firmware"
+            echo
+            echo '```'
+            find output/firmware \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n' \
+              | sort
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
