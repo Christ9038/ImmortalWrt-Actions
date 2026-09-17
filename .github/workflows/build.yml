@@ -92,6 +92,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          # GitHub-hosted runners may include an unavailable Microsoft APT
+          # source. It is unrelated to the ImmortalWrt build and can make
+          # apt-get update fail before dependencies are installed.
+          sudo find /etc/apt/sources.list.d \
+            -maxdepth 1 \
+            -type f \
+            -iname '*microsoft*' \
+            -delete
+
           sudo apt-get update
 
           sudo apt-get install -y \
