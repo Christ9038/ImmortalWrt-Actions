@@ -18,6 +18,7 @@ permissions:
 env:
   IMMORTALWRT_REPO: https://github.com/immortalwrt/immortalwrt.git
   IMMORTALWRT_SERIES: "25.12"
+  CACHE_NAMESPACE: v2
 
 jobs:
   build:
@@ -139,6 +140,7 @@ jobs:
       # 每次 build 都以正式发布 tag 为底座。
       # ------------------------------------------------------------
       - name: Clone ImmortalWrt
+        id: source
         shell: bash
         run: |
           set -euo pipefail
@@ -153,6 +155,7 @@ jobs:
 
           echo "ImmortalWrt commit:"
           git log -1 --oneline
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
           echo
           echo "Official feeds:"
@@ -161,50 +164,52 @@ jobs:
       # ------------------------------------------------------------
       # 缓存源码下载目录
       #
-      # dl/ 可以安全跨 patch release 重用，
-      # 不缓存 staging_dir/build_dir，避免诡异 ABI/工具链污染。
+      # dl/ 内的源码包和 Go module cache 可以重用。
+      # run_id 让每次成功下载都能生成新的不可变缓存，避免旧缓存被永久复用。
       # ------------------------------------------------------------
       - name: Restore download cache
-        uses: actions/cache@v5
+        id: download-cache
+        uses: actions/cache/restore@v5
         with:
           path: immortalwrt/dl
-          key: immortalwrt-dl-${{ runner.os }}-${{ steps.version.outputs.version }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}
+          key: immortalwrt-dl-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}-${{ github.run_id }}
           restore-keys: |
-            immortalwrt-dl-${{ runner.os }}-${{ steps.version.outputs.version }}-
-            immortalwrt-dl-${{ runner.os }}-
+            immortalwrt-dl-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}-
+            immortalwrt-dl-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-
 
       # ------------------------------------------------------------
       # 缓存 host tools 和交叉工具链
       #
-      # 工具链只依赖 release、target 和 subtarget，不依赖具体软件包选择。
-      # 因此修改 RK3568.config 时仍可以复用已构建的工具链。
+      # 工具链只在同一 ImmortalWrt commit、target 和 host 环境下复用。
       # ------------------------------------------------------------
       - name: Restore toolchain cache
-        uses: actions/cache@v5
+        id: toolchain-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             immortalwrt/staging_dir/host
             immortalwrt/staging_dir/toolchain-*
             immortalwrt/build_dir/host
-          key: immortalwrt-toolchain-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}
+            immortalwrt/build_dir/toolchain-*
+          key: immortalwrt-toolchain-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-${{ github.run_id }}
           restore-keys: |
-            immortalwrt-toolchain-${{ runner.os }}-rockchip-armv8-
+            immortalwrt-toolchain-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-
 
       # ------------------------------------------------------------
-      # 恢复目标构建目录
+      # 恢复编译器缓存
       #
-      # 保留上一次构建的 target build/staging 状态，让 make 根据源码、
-      # 配置和时间戳增量判断需要重编的内容。源码或配置变化时会自然失效。
+      # ccache 根据源码、编译参数和编译器身份判断目标文件是否可以复用，
+      # 比恢复整个 target build/staging 状态更可靠。
       # ------------------------------------------------------------
-      - name: Restore target build cache
-        uses: actions/cache@v5
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@v5
         with:
-          path: |
-            immortalwrt/build_dir/target-*
-            immortalwrt/staging_dir/target-*
-          key: immortalwrt-target-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}
+          path: immortalwrt/.ccache
+          key: immortalwrt-ccache-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-${{ hashFiles('configs/RK3568.config') }}-${{ github.run_id }}
           restore-keys: |
-            immortalwrt-target-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}-
+            immortalwrt-ccache-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-${{ hashFiles('configs/RK3568.config') }}-
+            immortalwrt-ccache-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-
 
       # ------------------------------------------------------------
       # 自定义源码
@@ -271,6 +276,38 @@ jobs:
           # 删除明显损坏/空文件，避免进入编译阶段才发现
           find dl -size -1024c -type f -print -delete || true
 
+      - name: Save download cache
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: immortalwrt/dl
+          key: ${{ steps.download-cache.outputs.cache-primary-key }}
+
+      # ------------------------------------------------------------
+      # 单独完成 host tools 和 toolchain，然后保存缓存。
+      # 这样即使后面的 package 编译失败，下次也不需要重新做工具链。
+      # ------------------------------------------------------------
+      - name: Build host tools and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd immortalwrt
+
+          make tools/compile -j"$(nproc)" || make tools/compile -j1 V=s
+          make toolchain/compile -j"$(nproc)" || make toolchain/compile -j1 V=s
+
+      - name: Save toolchain cache
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            immortalwrt/staging_dir/host
+            immortalwrt/staging_dir/toolchain-*
+            immortalwrt/build_dir/host
+            immortalwrt/build_dir/toolchain-*
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
+
       # ------------------------------------------------------------
       # 编译
       #
@@ -297,6 +334,13 @@ jobs:
 
             make -j1 V=s
           fi
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: immortalwrt/.ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       # ------------------------------------------------------------
       # 保存最终实际 config
