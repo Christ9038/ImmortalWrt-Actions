@@ -165,6 +165,23 @@ jobs:
             immortalwrt-dl-${{ runner.os }}-
 
       # ------------------------------------------------------------
+      # 缓存 host tools 和交叉工具链
+      #
+      # 工具链只依赖 release、target 和 subtarget，不依赖具体软件包选择。
+      # 因此修改 RK3568.config 时仍可以复用已构建的工具链。
+      # ------------------------------------------------------------
+      - name: Restore toolchain cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            immortalwrt/staging_dir/host
+            immortalwrt/staging_dir/toolchain-*
+            immortalwrt/build_dir/host
+          key: immortalwrt-toolchain-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}
+          restore-keys: |
+            immortalwrt-toolchain-${{ runner.os }}-rockchip-armv8-
+
+      # ------------------------------------------------------------
       # 自定义源码
       #
       # customize.sh 将负责：
