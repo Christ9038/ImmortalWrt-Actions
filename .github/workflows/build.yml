@@ -233,6 +233,33 @@ jobs:
 
           "${GITHUB_WORKSPACE}/scripts/customize.sh"
 
+      # 记录本次实际使用的 feeds / 自定义 package commit。
+      # target cache 必须绑定这些版本，不能跨 feed 状态复用。
+      - name: Record feed revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd immortalwrt
+          : > .feeds.lock
+
+          while IFS= read -r -d '' git_dir; do
+            repo_dir="${git_dir%/.git}"
+            printf '%s=%s\n' "${repo_dir}" "$(git -C "${repo_dir}" rev-parse HEAD)" \
+              >> .feeds.lock
+          done < <(
+            find feeds package \
+              -mindepth 2 \
+              -maxdepth 3 \
+              -type d \
+              -name .git \
+              -print0 \
+            | sort -z
+          )
+
+          sort -o .feeds.lock .feeds.lock
+          cat .feeds.lock
+
       # ------------------------------------------------------------
       # 加载 RK3568 seed config
       # ------------------------------------------------------------
@@ -257,6 +284,23 @@ jobs:
             'CONFIG_TARGET_|CONFIG_PACKAGE_luci-app-passwall2|CONFIG_PACKAGE_luci-app-mosdns|CONFIG_PACKAGE_luci-theme-argon' \
             .config \
             || true
+
+      # ------------------------------------------------------------
+      # 恢复 target 增量构建状态
+      #
+      # 这是本地 OpenWrt 增量编译最重要的部分。key 绑定完整配置、
+      # feeds 和源码版本；每次运行使用新的 run_id，编译完成后重新保存。
+      # ------------------------------------------------------------
+      - name: Restore target build cache
+        id: target-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            immortalwrt/build_dir/target-*
+            immortalwrt/staging_dir/target-*
+          key: immortalwrt-target-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh', 'immortalwrt/.config', 'immortalwrt/.feeds.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            immortalwrt-target-${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-${{ steps.source.outputs.commit }}-rockchip-armv8-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh', 'immortalwrt/.config', 'immortalwrt/.feeds.lock') }}-
 
       # ------------------------------------------------------------
       # 下载所有源码
@@ -341,6 +385,15 @@ jobs:
         with:
           path: immortalwrt/.ccache
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Save target build cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            immortalwrt/build_dir/target-*
+            immortalwrt/staging_dir/target-*
+          key: ${{ steps.target-cache.outputs.cache-primary-key }}
 
       # ------------------------------------------------------------
       # 保存最终实际 config
