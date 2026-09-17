@@ -191,6 +191,22 @@ jobs:
             immortalwrt-toolchain-${{ runner.os }}-rockchip-armv8-
 
       # ------------------------------------------------------------
+      # 恢复目标构建目录
+      #
+      # 保留上一次构建的 target build/staging 状态，让 make 根据源码、
+      # 配置和时间戳增量判断需要重编的内容。源码或配置变化时会自然失效。
+      # ------------------------------------------------------------
+      - name: Restore target build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            immortalwrt/build_dir/target-*
+            immortalwrt/staging_dir/target-*
+          key: immortalwrt-target-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}-${{ hashFiles('configs/RK3568.config', 'scripts/customize.sh') }}
+          restore-keys: |
+            immortalwrt-target-${{ runner.os }}-rockchip-armv8-${{ steps.version.outputs.version }}-
+
+      # ------------------------------------------------------------
       # 自定义源码
       #
       # customize.sh 将负责：
